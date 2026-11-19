@@ -1,0 +1,805 @@
+"""Pydantic request/response models.
+
+Every schema serialises to camelCase (`name_mr` → `nameMr`) so the existing
+React components keep the field names they already use, while Python keeps
+snake_case. Requests accept either spelling.
+"""
+
+from __future__ import annotations
+
+from datetime import date, datetime
+from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
+
+from app.services.sms import normalise_phone
+
+_PHONE_HELP = (
+    "Enter a valid 10-digit mobile number (it can start with +91 or 0), "
+    "or an international number starting with +."
+)
+
+
+def _phone_or_none(value: str | None) -> str | None:
+    """Blank means no number; anything else must be a real mobile number,
+    returned in E.164 form so every stored number has the same shape."""
+    if value is None or not str(value).strip():
+        return None
+    normalised = normalise_phone(str(value))
+    if normalised is None:
+        raise ValueError(_PHONE_HELP)
+    return normalised
+
+
+def to_camel(s: str) -> str:
+    head, *rest = s.split("_")
+    return head + "".join(w.capitalize() for w in rest)
+
+
+class ApiModel(BaseModel):
+    model_config = ConfigDict(
+        alias_generator=to_camel,
+        populate_by_name=True,
+        from_attributes=True,
+    )
+
+
+Role = Literal["admin", "officer", "citizen"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Auth
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _AccountIdentifier(ApiModel):
+    """An account named by email, or (for residents) by Aadhaar number."""
+
+    email: EmailStr | None = None
+    aadhaar: str | None = Field(default=None, max_length=20)
+
+    @model_validator(mode="after")
+    def _one_identifier(self):
+        if not self.email and not self.aadhaar:
+            raise ValueError("Enter an email address or an Aadhaar number.")
+        return self
+
+
+class LoginRequest(_AccountIdentifier):
+    password: str = Field(min_length=1)
+    # A random id the browser generates once and keeps; see KnownDevice.
+    device_id: str | None = Field(default=None, max_length=100)
+    device_label: str | None = Field(default=None, max_length=200)
+    # The mobile number complaint SMS go to. Optional for API clients; the
+    # sign-in form asks for it. Stored on the account when sign-in succeeds.
+    phone: str | None = Field(default=None, max_length=30)
+
+    @field_validator("phone")
+    @classmethod
+    def validate_phone(cls, value: str | None) -> str | None:
+        return _phone_or_none(value)
+
+
+class TokenPair(ApiModel):
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+    expires_in: int
+
+
+class LoginChallengeOut(ApiModel):
+    """Returned with 202 instead of tokens when the device is not recognised."""
+
+    challenge_id: str
+    poll_token: str
+    sent_to: list[str]
+    expires_in_minutes: int
+    # Demo mode only: the approve/deny link that the SMS and email would carry.
+    demo_decision_url: str | None = None
+
+
+class LoginChallengeStatus(ApiModel):
+    status: str  # pending | approved | denied | expired
+    tokens: TokenPair | None = None
+
+
+class OtpRequest(_AccountIdentifier):
+    pass
+
+
+class OtpSent(ApiModel):
+    """Where the OTP went, masked. `demo_otp` is filled only in demo mode,
+    because no SMS or email gateway is connected yet."""
+
+    sent_to: list[str]
+    expires_in_minutes: int
+    demo_otp: str | None = None
+
+
+class OtpReset(_AccountIdentifier):
+    otp: str = Field(min_length=4, max_length=10)
+    new_password: str = Field(min_length=8, max_length=128)
+
+
+class RefreshRequest(ApiModel):
+    refresh_token: str
+
+
+class UserOut(ApiModel):
+    id: str
+    email: EmailStr
+    full_name: str
+    role: Role
+    citizen_id: str | None = None
+    village_id: str | None = None
+    phone: str | None = None
+    is_active: bool
+    last_login_at: datetime | None = None
+
+
+class PhoneUpdate(ApiModel):
+    phone: str = Field(min_length=1, max_length=30)
+
+    @field_validator("phone")
+    @classmethod
+    def validate_phone(cls, value: str | None) -> str | None:
+        return _phone_or_none(value)
+
+
+class UserCreate(ApiModel):
+    email: EmailStr
+    password: str = Field(min_length=8)
+    full_name: str
+    role: Role = "citizen"
+    citizen_id: str | None = None
+    # Required for an officer: the Gram Panchayat they serve. Ignored for a
+    # resident, whose account takes the village on their own record, and for an
+    # admin, who has none.
+    village_id: str | None = None
+
+
+class RegistrationCreate(ApiModel):
+    """A resident applying for a portal account.
+
+    Note there is no `role` field. Self-registration always produces a citizen
+    account; officer and admin accounts are created by an admin.
+    """
+
+    full_name: str = Field(min_length=2, max_length=255)
+    email: EmailStr
+    password: str = Field(min_length=8)
+    phone: str | None = Field(default=None, max_length=30)
+    claimed_ward: int | None = Field(default=None, ge=1, le=50)
+    claimed_citizen_id: str | None = None
+    village_id: str | None = None
+    note: str | None = None
+
+    @field_validator("phone")
+    @classmethod
+    def validate_phone(cls, value: str | None) -> str | None:
+        return _phone_or_none(value)
+
+
+class RegistrationOut(ApiModel):
+    id: str
+    full_name: str
+    email: EmailStr
+    phone: str | None = None
+    claimed_ward: int | None = None
+    claimed_citizen_id: str | None = None
+    note: str | None = None
+    village_id: str | None = None
+    status: Literal["pending", "approved", "rejected"]
+    matched_citizen_id: str | None = None
+    review_note: str | None = None
+    created_at: datetime
+    reviewed_at: datetime | None = None
+    # Residents whose name or phone resembles the application, so an officer
+    # is choosing from candidates rather than searching from scratch.
+    suggested_matches: list[dict] = []
+
+
+class RegistrationDecision(ApiModel):
+    approve: bool
+    # Required when approving: which resident record this account belongs to.
+    citizen_id: str | None = None
+    review_note: str | None = None
+
+
+class PasswordChange(ApiModel):
+    current_password: str
+    new_password: str = Field(min_length=8)
+
+
+class AuditEventOut(ApiModel):
+    """One entry in the audit trail.
+
+    No request body is carried, because none is stored — see the note on
+    `AuditEvent` in `models.py`.
+    """
+
+    id: str
+    actor_id: str | None = None
+    actor_email: str | None = None
+    actor_role: str | None = None
+    action: str
+    method: str
+    path: str
+    status_code: int
+    entity_type: str | None = None
+    entity_id: str | None = None
+    village_id: str | None = None
+    ip: str | None = None
+    created_at: datetime
+
+
+class PasswordResetIssued(ApiModel):
+    """What the officer sees after issuing a reset — once.
+
+    The code is in this response and nowhere else readable: the database keeps
+    only a bcrypt hash of it. If the officer loses it before the resident has
+    it, the fix is to issue another, which is cheap and invalidates this one.
+    """
+
+    code: str
+    expires_at: datetime
+    user_email: str
+    user_name: str
+
+
+class PasswordResetRedeem(ApiModel):
+    """A resident setting their own password with a code from the office.
+
+    The officer never sees this password. They hand over a code that permits
+    setting one; what gets set is between the resident and the server.
+    """
+
+    email: EmailStr
+    code: str
+    new_password: str = Field(min_length=8)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Administrative hierarchy
+# ─────────────────────────────────────────────────────────────────────────────
+
+class PublicVillage(ApiModel):
+    """The little that an unauthenticated visitor may see about a village.
+
+    The block, district and state ride along because an applicant choosing
+    their Gram Panchayat should be able to see where it sits — a village name
+    on its own is ambiguous across a state, and several names repeat. All of it
+    is published Local Government Directory data.
+    """
+
+    id: str
+    name: str
+    name_mr: str
+    lgd_code: int | None = None
+    block_name: str
+    block_name_mr: str
+    district_name: str
+    district_name_mr: str
+    state_name: str
+    state_name_mr: str
+
+
+class VillageOut(ApiModel):
+    id: str
+    name: str
+    name_mr: str
+    lgd_code: int | None = None
+    census_code_2011: int | None = None
+    block_id: str
+    block_name: str
+    block_name_mr: str
+    district_name: str
+    district_name_mr: str
+    state_name: str
+    state_name_mr: str
+    latitude: float | None = None
+    longitude: float | None = None
+    population_2011: int | None = None
+    households_2011: int | None = None
+    ward_count: int = 0
+    # 'active' | 'merged_into_municipal_corporation' | 'uncertain'
+    gram_panchayat_status: str = "active"
+    notes: str | None = None
+
+
+class VillageDetail(VillageOut):
+    registered_citizens: int = 0
+    open_grievances: int = 0
+    active_projects: int = 0
+
+
+class VillageSummary(ApiModel):
+    """One row of the district rollup."""
+
+    id: str
+    name: str
+    name_mr: str
+    lgd_code: int | None = None
+    population_2011: int | None = None
+    gram_panchayat_status: str
+    registered_citizens: int
+    open_grievances: int
+    active_projects: int
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Families and citizens
+# ─────────────────────────────────────────────────────────────────────────────
+
+class FamilyMemberOut(ApiModel):
+    id: str
+    name: str
+    name_mr: str
+    relation: str | None = None
+    relation_mr: str | None = None
+    age: int
+    is_head: bool
+
+
+class FamilyOut(ApiModel):
+    id: str
+    name: str
+    name_mr: str
+    ward: int
+    address: str | None = None
+    address_mr: str | None = None
+    members: list[FamilyMemberOut] = []
+
+
+class CitizenBase(ApiModel):
+    name: str
+    name_mr: str
+    age: int = Field(ge=0, le=130)
+    gender: Literal["Male", "Female", "Other"]
+    gender_mr: str
+    occupation: str
+    occupation_mr: str
+    income: float = Field(ge=0)
+    ward: int = Field(ge=1)
+    phone: str | None = None
+    family_id: str | None = None
+    relation: str | None = None
+    relation_mr: str | None = None
+    is_head: bool = False
+    date_of_birth: date | None = None
+
+    # Attributes real scheme rules depend on. All synthetic in this project.
+    social_category: Literal["Open", "SC", "ST", "OBC", "SEBC", "VJNT", "SBC"] | None = None
+    is_bpl: bool = False
+    secc_listed: bool = False
+    ration_card_type: Literal["Yellow", "Orange", "White", "AAY", "Annapurna"] | None = None
+    land_holding_hectares: float | None = Field(default=None, ge=0)
+    marital_status: Literal["Single", "Married", "Widowed", "Divorced", "Abandoned"] | None = None
+    disability_percent: int | None = Field(default=None, ge=0, le=100)
+
+
+class CitizenCreate(CitizenBase):
+    id: str | None = None  # generated when omitted
+
+
+class CitizenUpdate(ApiModel):
+    name: str | None = None
+    name_mr: str | None = None
+    age: int | None = Field(default=None, ge=0, le=130)
+    gender: Literal["Male", "Female", "Other"] | None = None
+    gender_mr: str | None = None
+    occupation: str | None = None
+    occupation_mr: str | None = None
+    income: float | None = Field(default=None, ge=0)
+    ward: int | None = None
+    phone: str | None = None
+    family_id: str | None = None
+    relation: str | None = None
+    relation_mr: str | None = None
+    is_head: bool | None = None
+
+
+class CitizenOut(CitizenBase):
+    id: str
+    village_id: str | None = None
+    family_name: str | None = None
+    family_name_mr: str | None = None
+    family_members: list[FamilyMemberOut] = []
+    created_at: datetime | None = None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Schemes and eligibility
+# ─────────────────────────────────────────────────────────────────────────────
+
+class RequiredDocument(ApiModel):
+    name: str
+    name_mr: str
+
+
+class SchemeBase(ApiModel):
+    name: str
+    name_mr: str
+    description: str
+    description_mr: str
+    benefit: str
+    benefit_mr: str
+    criteria: dict[str, Any] = {}
+    required_documents: list[RequiredDocument] = []
+    status: Literal["active", "pending", "rejected"] = "active"
+    is_government_feed: bool = False
+    source_gov: str | None = None
+    form_url: str | None = None
+    level: Literal["central", "state", "district", "panchayat"] = "state"
+    category: str | None = None
+    announced_on: date | None = None
+    source_url: str | None = None
+    confidence: Literal["high", "medium", "low"] = "medium"
+    notes: str | None = None
+
+
+class SchemeCreate(SchemeBase):
+    id: str | None = None
+
+
+class SchemeReadResult(ApiModel):
+    """What came back from reading a Government Resolution.
+
+    The extra fields exist so the officer reviewing the proposal sees what the
+    reader could not handle, rather than only what it managed. A confident-looking
+    scheme with three silently dropped conditions is the failure this guards
+    against.
+    """
+
+    scheme: "SchemeOut"
+    # Eligibility conditions in the GR that no automatic rule can express.
+    unmappable_conditions: list[str] = []
+    # Criteria the reader proposed that this system does not evaluate.
+    discarded_criteria: list[str] = []
+    confidence_note: str | None = None
+    needs_manual_review: bool = False
+
+
+class SchemeUpdate(ApiModel):
+    name: str | None = None
+    name_mr: str | None = None
+    description: str | None = None
+    description_mr: str | None = None
+    benefit: str | None = None
+    benefit_mr: str | None = None
+    criteria: dict[str, Any] | None = None
+    required_documents: list[RequiredDocument] | None = None
+    status: Literal["active", "pending", "rejected"] | None = None
+
+
+class SchemeOut(SchemeBase):
+    id: str
+
+
+class DocumentGap(ApiModel):
+    name: str
+    name_mr: str
+    file_status: str | None = None  # None when the document was never uploaded
+
+
+EligibilityStatus = Literal["Eligible", "Missing Documents", "Needs Review", "Ineligible"]
+
+
+class EligibilityResult(ApiModel):
+    citizen_id: str
+    citizen_name: str
+    citizen_name_mr: str
+    ward: int
+    scheme_id: str
+    scheme_name: str
+    scheme_name_mr: str
+    status: EligibilityStatus
+    status_mr: str
+    criteria_passed: bool
+    failed_criteria: list[str] = []
+    missing_documents: list[DocumentGap] = []
+    unverified_documents: list[DocumentGap] = []
+    # Attributes the resident record does not hold, so a rule could not be run.
+    unknown_attributes: list[str] = []
+    explanation: str
+    explanation_mr: str
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Grievances
+# ─────────────────────────────────────────────────────────────────────────────
+
+Priority = Literal["Low", "Medium", "High", "Critical"]
+GrievanceStatus = Literal["Pending", "In Progress", "Resolved"]
+
+
+class GrievanceCreate(ApiModel):
+    title: str
+    title_mr: str | None = None
+    description: str
+    description_mr: str | None = None
+    ward: int
+    citizen_name: str | None = None
+    # Where the registration / accepted / resolved SMS go. A resident who
+    # leaves it out is notified on the number they signed in with.
+    phone: str | None = Field(default=None, max_length=30)
+    latitude: float | None = None
+    longitude: float | None = None
+
+    @field_validator("phone")
+    @classmethod
+    def validate_phone(cls, value: str | None) -> str | None:
+        return _phone_or_none(value)
+    # Optional overrides; the classifier fills these when omitted.
+    category: str | None = None
+    priority: Priority | None = None
+
+
+class GrievanceUpdate(ApiModel):
+    status: GrievanceStatus | None = None
+    priority: Priority | None = None
+    category: str | None = None
+    officer_notes: str | None = None
+    department: str | None = None
+
+
+class GrievanceEventOut(ApiModel):
+    id: str
+    event_type: str
+    from_status: str | None = None
+    to_status: str | None = None
+    note: str | None = None
+    note_mr: str | None = None
+    actor_name: str | None = None
+    created_at: datetime
+
+
+class GrievanceOut(ApiModel):
+    id: str
+    title: str
+    title_mr: str
+    description: str
+    description_mr: str
+    category: str
+    category_mr: str
+    priority: Priority
+    priority_mr: str
+    status: GrievanceStatus
+    status_mr: str
+    department: str
+    department_mr: str
+    ward: int
+    latitude: float | None = None
+    longitude: float | None = None
+    citizen_id: str | None = None
+    citizen_name: str
+    phone: str | None = None
+    submitted_date: date
+    resolved_date: date | None = None
+    officer_notes: str | None = None
+    auto_classified: bool = False
+    village_id: str | None = None
+
+
+class SmsNotificationOut(ApiModel):
+    id: str
+    event: str
+    phone_masked: str | None = None
+    message: str
+    provider: str
+    status: str
+    error: str | None = None
+    created_at: datetime
+
+
+class GrievanceDetail(GrievanceOut):
+    """A single complaint with its full history — what the citizen's tracking
+    view reads."""
+
+    events: list[GrievanceEventOut] = []
+    sms_notifications: list[SmsNotificationOut] = []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Projects
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ProjectBase(ApiModel):
+    name: str
+    name_mr: str
+    description: str
+    description_mr: str
+    progress: int = Field(ge=0, le=100)
+    budget: float = Field(ge=0)
+    utilized: float = Field(ge=0)
+    status: Literal["Ongoing", "Completed", "Delayed"]
+    status_mr: str
+    ward: int
+    location: str
+    location_mr: str
+    latitude: float
+    longitude: float
+    start_date: date | None = None
+    expected_completion: date | None = None
+
+
+class ProjectCreate(ProjectBase):
+    id: str | None = None
+
+
+class ProjectUpdate(ApiModel):
+    progress: int | None = Field(default=None, ge=0, le=100)
+    utilized: float | None = Field(default=None, ge=0)
+    status: Literal["Ongoing", "Completed", "Delayed"] | None = None
+    status_mr: str | None = None
+    description: str | None = None
+    expected_completion: date | None = None
+
+
+class ProjectOut(ProjectBase):
+    id: str
+    village_id: str | None = None
+
+    @field_validator("budget", "utilized", mode="before")
+    @classmethod
+    def _decimal_to_float(cls, v: Any) -> Any:
+        return float(v) if v is not None else v
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Documents
+# ─────────────────────────────────────────────────────────────────────────────
+
+class DocumentOut(ApiModel):
+    id: str
+    citizen_id: str
+    citizen_name: str | None = None
+    doc_type: str
+    doc_type_mr: str
+    file_name: str
+    status: Literal["Pending Verification", "Verified", "Rejected"]
+    status_mr: str
+    submitted_date: date
+    verified_at: datetime | None = None
+    rejection_reason: str | None = None
+    size_bytes: int | None = None
+
+
+class DocumentReview(ApiModel):
+    status: Literal["Verified", "Rejected"]
+    rejection_reason: str | None = None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Gram Sabha
+# ─────────────────────────────────────────────────────────────────────────────
+
+ActionStatus = Literal["Pending", "In Progress", "Completed"]
+
+
+class ActionItemOut(ApiModel):
+    id: str
+    meeting_id: str
+    action: str
+    action_mr: str
+    responsible: str
+    responsible_mr: str
+    deadline: date | None = None
+    status: ActionStatus
+    status_mr: str
+
+
+class ActionItemCreate(ApiModel):
+    """A follow-up task an officer assigns against a meeting by hand.
+
+    The Marathi fields are optional: an officer typing quickly in one language
+    should not be blocked, and the reader falls back to whichever was given
+    rather than being shown an empty string.
+    """
+
+    action: str = Field(min_length=2, max_length=500)
+    action_mr: str | None = None
+    responsible: str = Field(min_length=2, max_length=255)
+    responsible_mr: str | None = None
+    deadline: date | None = None
+
+
+class ActionItemUpdate(ApiModel):
+    status: ActionStatus | None = None
+    responsible: str | None = None
+    deadline: date | None = None
+
+
+class SabhaMeetingOut(ApiModel):
+    id: str
+    meeting_date: date
+    title: str
+    title_mr: str
+    summary: str
+    summary_mr: str
+    decisions: list[str] = []
+    decisions_mr: list[str] = []
+    source_file_name: str | None = None
+    extracted_by: str | None = None
+    action_items: list[ActionItemOut] = []
+
+
+class SabhaMeetingCreate(ApiModel):
+    meeting_date: date
+    title: str
+    title_mr: str | None = None
+    summary: str = ""
+    summary_mr: str = ""
+    decisions: list[str] = []
+    decisions_mr: list[str] = []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GIS and analytics
+# ─────────────────────────────────────────────────────────────────────────────
+
+class FacilityOut(ApiModel):
+    id: str
+    name: str
+    name_mr: str
+    facility_type: str
+    latitude: float
+    longitude: float
+    ward: int | None = None
+    details: str | None = None
+    details_mr: str | None = None
+
+
+class DashboardStats(ApiModel):
+    total_citizens: int
+    total_families: int
+    open_grievances: int
+    critical_grievances: int
+    resolved_grievances: int
+    active_projects: int
+    delayed_projects: int
+    total_budget: float
+    total_utilized: float
+    pending_documents: int
+    next_meeting_date: date | None = None
+
+
+class NamedCount(ApiModel):
+    label: str
+    label_mr: str | None = None
+    value: float
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Assistant
+# ─────────────────────────────────────────────────────────────────────────────
+
+class AssistantQuery(ApiModel):
+    query: str = Field(min_length=1, max_length=2000)
+    language: Literal["en", "mr"] = "en"
+
+
+class RetrievedSource(ApiModel):
+    entity_type: str
+    entity_id: str
+    title: str
+    score: float | None = None
+
+
+class AssistantAnswer(ApiModel):
+    answer: str
+    sources: list[RetrievedSource] = []
+    # How the answer was written:
+    #   llm                      the model wrote it from retrieved facts
+    #   retrieval_only           no model key, or the call failed
+    #   retrieval_only_personal  the facts describe one resident, so they were
+    #                            deliberately not sent to the model
+    # The last two read the same to a user unless they are told apart, and they
+    # mean very different things — one is a degraded service, the other is the
+    # privacy rule working.
+    #   direct                   computed by the rule engine / records for a
+    #                            precise question (a scheme's rules, who qualifies)
+    mode: Literal["llm", "retrieval_only", "retrieval_only_personal", "unavailable", "direct"]
+    # How the records were found: by embedding similarity plus graph expansion,
+    # or by keyword routing. Reported rather than assumed, because the semantic
+    # path silently falls back and the reader deserves to know which ran.
+    retrieval: Literal["semantic", "keyword"] = "keyword"

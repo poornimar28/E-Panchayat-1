@@ -1,0 +1,195 @@
+"""Shared FastAPI dependencies: database session, current user, role guards.
+
+This module is where role-based access control actually lives. A route that
+does not depend on one of these guards is public — there is no other way in.
+"""
+
+from collections.abc import Callable
+
+import jwt
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from sqlalchemy.orm import Session
+
+from app.core.security import as_utc, decode_token
+from app.db.session import get_db
+from app.models import Citizen, User
+
+bearer_scheme = HTTPBearer(auto_error=False)
+
+CREDENTIALS_ERROR = HTTPException(
+    status_code=status.HTTP_401_UNAUTHORIZED,
+    detail="Not authenticated",
+    headers={"WWW-Authenticate": "Bearer"},
+)
+
+
+def get_current_user(
+    creds: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+    db: Session = Depends(get_db),
+) -> User:
+    if creds is None:
+        raise CREDENTIALS_ERROR
+    try:
+        payload = decode_token(creds.credentials, "access")
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Session expired. Sign in again.",
+            headers={"WWW-Authenticate": "Bearer"},
+        ) from None
+    except jwt.PyJWTError:
+        raise CREDENTIALS_ERROR from None
+
+    user = db.get(User, payload.get("sub"))
+    if user is None or not user.is_active:
+        raise CREDENTIALS_ERROR
+    if token_is_revoked(user, payload):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Your password was changed. Sign in again.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return user
+
+
+def token_is_revoked(user: User, payload: dict) -> bool:
+    """Whether this token predates the account's last password change.
+
+    Access and refresh tokens are stateless, so there is no server-side session
+    to end. Without this check, changing or resetting a password would not
+    remove whoever already held the account — they would stay signed in until
+    their refresh token expired a week later, which makes a reset close to
+    useless in the one situation it exists for.
+
+    `iat` is whole seconds and `tokens_valid_from` is stored truncated to the
+    second, so a token minted in the same second as the revocation survives.
+    That one-second overlap is the price of comparing the two, and it is the
+    right side to err on: the alternative rejects the fresh token issued by the
+    sign-in immediately after a reset.
+    """
+    valid_from = as_utc(user.tokens_valid_from)
+    if valid_from is None:
+        return False
+    issued_at = payload.get("iat")
+    if issued_at is None:
+        # A token with no `iat` cannot be placed in time, so it cannot be shown
+        # to post-date the revocation.
+        return True
+    return issued_at < valid_from.timestamp()
+
+
+def require_roles(*roles: str) -> Callable[[User], User]:
+    """Guard factory. `Depends(require_roles("officer", "admin"))`."""
+
+    allowed = set(roles)
+
+    def _guard(user: User = Depends(get_current_user)) -> User:
+        if user.role not in allowed:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="This action requires a Panchayat officer account.",
+            )
+        return user
+
+    return _guard
+
+
+# Convenience aliases used across the routers.
+require_officer = require_roles("officer", "admin")
+require_admin = require_roles("admin")
+
+
+def village_scope(user: User) -> str | None:
+    """Which village's records this user may see.
+
+    Returns a village id to filter by, or None meaning "all villages".
+
+    None is the admin's answer and nobody else's. This used to return
+    `user.village_id` for everyone else, and every caller reads None as "apply
+    no filter" — so an officer whose account had no village assigned was not
+    shown nothing, they were shown the whole block. That is the wrong way for a
+    missing value to fail, and it was reachable: `POST /auth/users` created
+    officers with no village at all. An account without an assignment is now
+    refused wherever a village would have been needed.
+
+    A resident's account falls back to the village on their own record, so one
+    created before accounts carried a village still works.
+    """
+    if user.role == "admin":
+        return None
+
+    village_id = user.village_id
+    if village_id is None and user.role == "citizen" and user.citizen is not None:
+        village_id = user.citizen.village_id
+
+    if village_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "This account is not assigned to a Gram Panchayat. "
+                "Ask the administrator to assign one."
+            ),
+        )
+    return village_id
+
+
+def assert_can_access_village(user: User, village_id: str | None) -> None:
+    """Guard for any route that opens, changes or deletes one record by its ID.
+
+    Scoping a list is not enough on its own. A list that leaves a record out
+    protects nothing if the record can still be fetched, edited or deleted by
+    whoever knows its ID — and the seeded IDs are `griev_201` and `proj_301`.
+    Every by-ID handler calls this with the record's own village.
+
+    A record with no village belongs to no Gram Panchayat, so only an admin may
+    touch it. The lists already behave that way (`village_id == scope` never
+    matches NULL), and an ID should not open what the list would not show.
+    """
+    scope = village_scope(user)
+    if scope is not None and village_id != scope:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="That record belongs to another Gram Panchayat.",
+        )
+
+
+def assert_can_read_citizen(db: Session, user: User, citizen_id: str) -> None:
+    """A citizen reads only their own file; an officer only their own village.
+
+    This replaces the old behaviour where typing any citizen ID at the login
+    screen opened that resident's record.
+
+    It takes the session because the village check needs to look the resident
+    up. That is deliberate: an earlier version took only (user, citizen_id) and
+    so could not check the village at all, which left every route relying on it
+    alone open to an officer of a different Gram Panchayat. `citizens.py`
+    happened to repeat the check by hand afterwards and was safe; the document
+    and eligibility routes did not, and were not. Putting the check here means
+    a new route cannot forget it.
+    """
+    if user.role == "citizen":
+        if user.citizen_id != citizen_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You can only view your own records.",
+            )
+        return
+
+    scope = village_scope(user)
+    if scope is None:
+        return  # an admin works across the whole district
+
+    citizen = db.get(Citizen, citizen_id)
+    # A resident who does not exist is the caller's 404 to raise. Refusing here
+    # instead would tell an officer which ids exist in villages they cannot see.
+    if citizen is None:
+        return
+    # Strict: a resident with no village on record belongs to no officer. The
+    # resident list already leaves such a row out, and the ID must not open
+    # what the list hides.
+    if citizen.village_id != scope:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="That resident belongs to another Gram Panchayat.",
+        )
